@@ -357,33 +357,55 @@ function localHour(cfg, ts) {
 }
 const mins = (s) => Math.max(1, Math.round(s / 60));
 
-// All channels for the configuration, filtered.
-async function allChannels(cfg) {
-  const lists = await Promise.all(cfg.cc.map(async (cc) => [cc, (await channelsOf(cc)) || []]));
-  const out = [];
+// Channel filter shared by every catalog.
+function keepChannel(cfg, cats, langs, srcs, ch) {
+  if (ch.x && !cfg.nsfw) return false;
+  if (cfg.guide && !ch.g) return false;
+  if (cats.size && !(ch.c || []).some((c) => cats.has(c))) return false;
+  if (langs.size && !(ch.la || []).some((l) => langs.has(l))) return false;
+  if (cfg.working && !ch.v) return false;
+  if (srcs.size && !(ch.o || ["iptv"]).some((o) => srcs.has(o))) return false;
+  return true;
+}
+
+// All channels for the configuration, filtered. Countries are interleaved
+// (one channel each, round-robin) so a single page of 100 shows every country
+// instead of only the first one's. `only` limits the work to one country.
+async function allChannels(cfg, only) {
+  const ccs = only ? [only] : cfg.cc;
+  const lists = await Promise.all(ccs.map(async (cc) => [cc, (await channelsOf(cc)) || []]));
   const cats = new Set(cfg.cat);
   const langs = new Set(cfg.lang);
   const srcs = new Set(cfg.src || []);
+  const groups = [];
+  let longest = 0;
   for (const [cc, list] of lists) {
+    const g = [];
     for (const ch of list) {
-      if (ch.x && !cfg.nsfw) continue;
-      if (cfg.guide && !ch.g) continue;
-      if (cats.size && !(ch.c || []).some((c) => cats.has(c))) continue;
-      if (langs.size && !(ch.la || []).some((l) => langs.has(l))) continue;
-      if (cfg.working && !ch.v) continue;
-      if (srcs.size && !(ch.o || ["iptv"]).some((o) => srcs.has(o))) continue;
-      out.push({ ...ch, cc });
+      if (!keepChannel(cfg, cats, langs, srcs, ch)) continue;
+      // the copy is cached per country, so tagging it once is enough
+      if (ch.cc !== cc) ch.cc = cc;
+      g.push(ch);
     }
+    groups.push(g);
+    if (g.length > longest) longest = g.length;
   }
+  if (groups.length === 1) return groups[0];
+  const out = new Array(longest);
+  let n = 0;
+  for (let i = 0; i < longest; i++) for (const g of groups) if (i < g.length) out[n++] = g[i];
+  out.length = n;
   return out;
 }
 
-async function nowMap(cfg) {
-  const maps = await Promise.all(cfg.cc.map(async (cc) => [cc, (await nowOf(cc)) || { p: {} }]));
-  const m = new Map();
-  for (const [cc, d] of maps) for (const [id, progs] of Object.entries(d.p || {})) m.set(`${cc}:${id}`, progs);
-  return m;
+// Programmes per country: Map<cc, {channelId: [programme]}> — cheaper than one
+// Map entry per channel when hundreds of channels are loaded.
+async function nowMap(cfg, only) {
+  const ccs = only ? [only] : cfg.cc;
+  const maps = await Promise.all(ccs.map(async (cc) => [cc, (await nowOf(cc))?.p || {}]));
+  return new Map(maps);
 }
+const progsOf = (now, ch) => (now.get(ch.cc) || {})[ch.id];
 
 const metaId = (cc, id) => `${PREFIX}:${cc}:${id}`;
 function parseId(id) {
@@ -404,12 +426,34 @@ function current(progs, t) {
 
 // ------------------------------------------------------------------ manifest
 
+// Chinese labels for the countries this deployment ships with, so the country
+// filter reads 中国 / 香港 / … in Stremio instead of English names.
+const CC_NAMES_ZH = {
+  cn: "中国", hk: "香港", tw: "台湾", jp: "日本", kr: "韩国", us: "美国",
+  uk: "英国", th: "泰国", au: "澳大利亚", fr: "法国", es: "西班牙",
+  de: "德国", it: "意大利", ru: "俄罗斯", in: "印度", sg: "新加坡",
+  my: "马来西亚", id: "印度尼西亚", ph: "菲律宾", vn: "越南", ca: "加拿大",
+  mx: "墨西哥", br: "巴西", ar: "阿根廷", nl: "荷兰", pt: "葡萄牙",
+  tr: "土耳其", ae: "阿联酋", sa: "沙特阿拉伯", il: "以色列", eg: "埃及",
+  za: "南非", nz: "新西兰", ch: "瑞士", se: "瑞典", no: "挪威",
+  dk: "丹麦", fi: "芬兰", pl: "波兰", cz: "捷克", gr: "希腊", at: "奥地利",
+  be: "比利时", ie: "爱尔兰", ua: "乌克兰", pk: "巴基斯坦", bd: "孟加拉国",
+};
+
+// Genre label of a country, used by both the manifest and the genre filter.
+const ccLabel = (cc, cnt) => {
+  const zh = CC_NAMES_ZH[cc];
+  const c = (cnt || {})[cc];
+  if (zh) return `${(c && c.flag) || ""} ${zh}`.trim();
+  return c ? `${c.flag} ${c.name}` : cc.toUpperCase();
+};
+
 async function manifest(cfg, cfgSeg, origin) {
   const cats = (await categories()) || {};
   const cnt = (await countries()) || {};
   const genreOptions = [
     ...Object.entries(cats).map(([, n]) => n),
-    ...(cfg.cc.length > 1 ? cfg.cc.map((cc) => (cnt[cc] ? `${cnt[cc].flag} ${cnt[cc].name}` : cc.toUpperCase())) : []),
+    ...(cfg.cc.length > 1 ? cfg.cc.map((cc) => ccLabel(cc, cnt)) : []),
   ];
   const catalogs = [];
   const add = (id, name, extra = []) => catalogs.push({ type: "tv", id, name, extra });
@@ -421,6 +465,8 @@ async function manifest(cfg, cfgSeg, origin) {
   if (cfg.rows.includes("tonight")) add("nltv_tonight", `${cfg.name} · Tonight`, [genre, skip]);
   if (cfg.rows.includes("channels") || !catalogs.length)
     add("nltv_channels", `${cfg.name} · Channels`, [genre, { name: "search", isRequired: false }, skip]);
+  // One row per country, so a country can also be picked in one tap.
+  if (cfg.cc.length > 1) for (const cc of cfg.cc) add(`nltv_cc_${cc}`, `${cfg.name} · ${ccLabel(cc, cnt)}`, [skip]);
   // search across programmes too
   add("nltv_search", `${cfg.name} · Programmes`, [{ name: "search", isRequired: true }]);
 
@@ -456,7 +502,8 @@ async function genreFilter(cfg, extra) {
   const catId = Object.keys(cats).find((k) => cats[k] === extra.genre);
   if (catId) return (ch) => (ch.c || []).includes(catId);
   const cnt = (await countries()) || {};
-  const cc = Object.keys(cnt).find((k) => `${cnt[k].flag} ${cnt[k].name}` === extra.genre);
+  const cc = (cfg.cc.length > 1 ? cfg.cc : Object.keys(cnt)).find(
+    (k) => ccLabel(k, cnt) === extra.genre || (cnt[k] && `${cnt[k].flag} ${cnt[k].name}` === extra.genre));
   if (cc) return (ch) => ch.cc === cc;
   return () => true;
 }
@@ -478,7 +525,7 @@ function programmeItem(cfg, ch, p, label) {
 }
 
 function channelItem(cfg, ch, now) {
-  const [cur, next] = current(now.get(`${ch.cc}:${ch.id}`), Date.now() / 1000);
+  const [cur, next] = current(progsOf(now, ch), Date.now() / 1000);
   let desc = "";
   if (cur) desc = `Now: ${cur.t} (until ${fmtTime(cfg, cur.e)})`;
   if (next) desc += `${desc ? "\n" : ""}Next: ${next.t} at ${fmtTime(cfg, next.s)}`;
@@ -494,28 +541,57 @@ function channelItem(cfg, ch, now) {
   };
 }
 
+// "Tonight" = 19:00–24:00 today in the configured time zone. Computed once per
+// request from a numeric window instead of an Intl call per programme.
+const tzFmtCache = new Map();
+function tzFmt(tz) {
+  let f = tzFmtCache.get(tz);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    tzFmtCache.set(tz, f);
+  }
+  return f;
+}
+function tzOffsetSeconds(tz, ts) {
+  const p = {};
+  for (const q of tzFmt(tz).formatToParts(new Date(ts * 1000))) p[q.type] = q.value;
+  return (Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - ts * 1000) / 1000;
+}
+function zonedToEpoch(tz, dayStr, hour) {
+  const naive = Date.parse(`${dayStr}T${String(hour).padStart(2, "0")}:00:00Z`) / 1000;
+  const off = tzOffsetSeconds(tz, naive - tzOffsetSeconds(tz, naive));
+  return naive - off;
+}
+function tonightWindow(cfg, t) {
+  const start = zonedToEpoch(cfg.tz, dayKey(cfg, t), 19);
+  return [start, start + 5 * 3600];
+}
+
 async function catalog(cfg, id, extra) {
   const skip = Number(extra.skip) || 0;
   const page = 100;
   const t = Date.now() / 1000;
-  const [chans, now] = await Promise.all([allChannels(cfg), nowMap(cfg)]);
+  // nltv_cc_<cc> is a single-country row: load only that country.
+  const only = id.startsWith("nltv_cc_") ? id.slice(8) : null;
+  const [chans, now] = await Promise.all([allChannels(cfg, only), nowMap(cfg, only)]);
   const gf = await genreFilter(cfg, extra);
-  let items = [];
+  const paged = (list, label) => list.slice(skip, skip + page).map(([p, ch]) => programmeItem(cfg, ch, p, label(p)));
+  let out = [];
 
   if (id === "nltv_channels") {
     const q = (extra.search || "").toLowerCase().trim();
-    items = chans
-      .filter(gf)
-      .filter((ch) => !q || ch.n.toLowerCase().includes(q))
-      .map((ch) => channelItem(cfg, ch, now));
+    const list = chans.filter(gf).filter((ch) => !q || ch.n.toLowerCase().includes(q));
+    out = list.slice(skip, skip + page).map((ch) => channelItem(cfg, ch, now));
+  } else if (only) {
+    out = chans.filter(gf).slice(skip, skip + page).map((ch) => channelItem(cfg, ch, now));
   } else if (id === "nltv_search") {
     const q = (extra.search || "").toLowerCase().trim();
     if (!q) return { metas: [] };
     const seen = new Set();
     const hits = [];
     for (const ch of chans) {
-      const progs = now.get(`${ch.cc}:${ch.id}`) || [];
-      for (const p of progs) {
+      const progs = progsOf(now, ch);
+      if (progs) for (const p of progs) {
         if (p.e < t || !p.t.toLowerCase().includes(q)) continue;
         if (seen.has(ch.id)) break;
         seen.add(ch.id);
@@ -525,43 +601,47 @@ async function catalog(cfg, id, extra) {
       if (!seen.has(ch.id) && ch.n.toLowerCase().includes(q)) hits.push([null, ch]);
     }
     hits.sort((a, b) => (a[0]?.s ?? 1e12) - (b[0]?.s ?? 1e12));
-    items = hits.map(([p, ch]) =>
+    out = hits.slice(skip, skip + page).map(([p, ch]) =>
       p ? programmeItem(cfg, ch, p, p.s <= t ? `On now until ${fmtTime(cfg, p.e)}` : `Starts ${fmtTime(cfg, p.s)}`) : channelItem(cfg, ch, now));
   } else if (id === "nltv_now" || id.startsWith("nltv_now_")) {
-    const only = id.startsWith("nltv_now_") ? id.slice(9) : null;
+    const cat = id.startsWith("nltv_now_") ? id.slice(9) : null;
+    const items = [];
     for (const ch of chans) {
-      if (!gf(ch) || (only && !(ch.c || []).includes(only))) continue;
-      const [cur] = current(now.get(`${ch.cc}:${ch.id}`), t);
+      if (!gf(ch) || (cat && !(ch.c || []).includes(cat))) continue;
+      const [cur] = current(progsOf(now, ch), t);
       if (cur) items.push([cur, ch]);
     }
     // programmes that just started first, then by time left
     items.sort((a, b) => (t - a[0].s) / (a[0].e - a[0].s) - (t - b[0].s) / (b[0].e - b[0].s));
-    items = items.map(([p, ch]) => programmeItem(cfg, ch, p, `${mins(p.e - t)} min left`));
+    out = paged(items, (p) => `${mins(p.e - t)} min left`);
   } else if (id === "nltv_soon") {
+    const items = [];
     for (const ch of chans) {
       if (!gf(ch)) continue;
-      const [, next] = current(now.get(`${ch.cc}:${ch.id}`), t);
+      const [, next] = current(progsOf(now, ch), t);
       if (next && next.s - t < 3 * 3600) items.push([next, ch]);
     }
     items.sort((a, b) => a[0].s - b[0].s);
-    items = items.map(([p, ch]) => programmeItem(cfg, ch, p, `Starts ${fmtTime(cfg, p.s)} · in ${mins(p.s - t)} min`));
+    out = paged(items, (p) => `Starts ${fmtTime(cfg, p.s)} · in ${mins(p.s - t)} min`);
   } else if (id === "nltv_tonight") {
-    const today = dayKey(cfg, t);
+    const [start, end] = tonightWindow(cfg, t);
+    const items = [];
     for (const ch of chans) {
       if (!gf(ch)) continue;
-      for (const p of now.get(`${ch.cc}:${ch.id}`) || []) {
+      const progs = progsOf(now, ch);
+      if (!progs) continue;
+      for (const p of progs) {
         if (p.e < t) continue;
-        const h = localHour(cfg, p.s);
-        if (dayKey(cfg, p.s) === today && h >= 19 && h <= 23) {
+        if (p.s >= start && p.s < end) {
           items.push([p, ch]);
           break;
         }
       }
     }
     items.sort((a, b) => a[0].s - b[0].s);
-    items = items.map(([p, ch]) => programmeItem(cfg, ch, p, `Tonight ${fmtTime(cfg, p.s)}`));
+    out = paged(items, (p) => `Tonight ${fmtTime(cfg, p.s)}`);
   }
-  return { metas: items.slice(skip, skip + page) };
+  return { metas: out };
 }
 
 // ------------------------------------------------------------------ meta
@@ -706,12 +786,14 @@ async function playlist(cfg) {
 
 // ------------------------------------------------------------------ router
 
-// Built-in configuration for this deployment: China channels, Shanghai time,
-// Chinese catalog name. Requests that carry no <config> segment (for example
-// /manifest.json or /catalog/tv/nltv_now.json) use this instead of failing
-// with "bad configuration", so the addon can be installed from a short URL.
+// Built-in configuration for this deployment: 11 countries/regions (China,
+// Hong Kong, Taiwan, Japan, South Korea, US, UK, Thailand, Australia, France,
+// Spain), Shanghai time, Chinese catalog name. Requests that carry no <config>
+// segment (for example /manifest.json or /catalog/tv/nltv_now.json) use this
+// instead of failing with "bad configuration", so the addon can be installed
+// from a short URL. Regenerate with base64url(JSON.stringify(cfg)) — no padding.
 const DEFAULT_SEG =
-  "eyJjYyI6WyJjbiJdLCJ0eiI6IkFzaWEvU2hhbmdoYWkiLCJuYW1lIjoi55u05pKt55S16KeGIiwic2hhcGUiOiJsYW5kc2NhcGUiLCJyb3dzIjpbIm5vdyIsInNvb24iLCJ0b25pZ2h0IiwiY2hhbm5lbHMiXSwiY2xlYW4iOnRydWUsImRheXMiOjMsIm1heFN0cmVhbXMiOjN9";
+  "eyJjYyI6WyJjbiIsImhrIiwidHciLCJqcCIsImtyIiwidXMiLCJ1ayIsInRoIiwiYXUiLCJmciIsImVzIl0sInR6IjoiQXNpYS9TaGFuZ2hhaSIsIm5hbWUiOiLnm7Tmkq3nlLXop4YiLCJzaGFwZSI6ImxhbmRzY2FwZSIsInJvd3MiOlsibm93Iiwic29vbiIsInRvbmlnaHQiLCJjaGFubmVscyJdLCJjbGVhbiI6dHJ1ZSwiZGF5cyI6MywibWF4U3RyZWFtcyI6M30";
 
 // Paths that make sense without a <config> segment.
 const BARE_ROUTES = new Set([
@@ -752,7 +834,12 @@ export default {
       if (rest[0] === "playlist.m3u" || rest[0] === "playlist.m3u8") return playlist(cfg);
       if (rest[0] === "epg.xml.gz" && cfg.cc.length) return Response.redirect(`${RAW}x/${cfg.cc[0]}.xml.gz`, 302);
       if (rest[0] === "channels.json") return json(await allChannels(cfg), 600);
-      if (rest[0] === "now.json") return json(Object.fromEntries(await nowMap(cfg)), 300);
+      if (rest[0] === "now.json") {
+        const nm = await nowMap(cfg);
+        const out = {};
+        for (const [cc, progs] of nm) for (const [chId, list] of Object.entries(progs || {})) out[`${cc}:${chId}`] = list;
+        return json(out, 300);
+      }
       if (type !== "tv" && type !== "series") return json({ metas: [], streams: [] }, 3600);
       if (resource === "catalog") return json(await catalog(cfg, strip(id), parseExtra(strip(extraSeg))), 300);
       if (resource === "meta") return json(await meta(cfg, strip(id)), 600);
