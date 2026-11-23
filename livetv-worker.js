@@ -706,6 +706,19 @@ async function playlist(cfg) {
 
 // ------------------------------------------------------------------ router
 
+// Built-in configuration for this deployment: China channels, Shanghai time,
+// Chinese catalog name. Requests that carry no <config> segment (for example
+// /manifest.json or /catalog/tv/nltv_now.json) use this instead of failing
+// with "bad configuration", so the addon can be installed from a short URL.
+const DEFAULT_SEG =
+  "eyJjYyI6WyJjbiJdLCJ0eiI6IkFzaWEvU2hhbmdoYWkiLCJuYW1lIjoi55u05pKt55S16KeGIiwic2hhcGUiOiJsYW5kc2NhcGUiLCJyb3dzIjpbIm5vdyIsInNvb24iLCJ0b25pZ2h0IiwiY2hhbm5lbHMiXSwiY2xlYW4iOnRydWUsImRheXMiOjMsIm1heFN0cmVhbXMiOjN9";
+
+// Paths that make sense without a <config> segment.
+const BARE_ROUTES = new Set([
+  "configure", "manifest.json", "playlist.m3u", "playlist.m3u8", "epg.xml.gz",
+  "channels.json", "now.json", "catalog", "meta", "stream",
+]);
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -715,17 +728,24 @@ export default {
 
     try {
       if (!parts.length) return Response.redirect(`${origin}/configure`, 302);
-      if (parts[0] === "configure") return configurePage(origin, null, DEFAULTS);
       if (parts[0] === "api" && parts[1] === "countries") return json((await countries()) || {}, 3600);
       if (parts[0] === "api" && parts[1] === "categories") return json((await categories()) || {}, 86400);
       if (parts[0] === "api" && parts[1] === "report") return json((await data("report.json", 900)) || {}, 900);
       if (parts[0] === "logo.png") return Response.redirect("https://raw.githubusercontent.com/jyotiprakash101/nuvio-livetv/main/worker/logo.png", 302);
 
-      const cfg = readConfig(parts[0]);
+      // If the first segment is a bare route, fall back to the built-in config;
+      // a real <config> segment keeps working exactly as before.
+      let cfgSeg = parts[0];
+      let rest = parts.slice(1);
+      if (BARE_ROUTES.has(parts[0])) {
+        cfgSeg = DEFAULT_SEG;
+        rest = parts;
+      }
+
+      const cfg = readConfig(cfgSeg);
       if (!cfg) return json({ error: "bad configuration" }, 60);
-      const rest = parts.slice(1);
       if (rest[0] === "configure") return configurePage(origin, cfg, DEFAULTS);
-      if (rest[0] === "manifest.json") return json(await manifest(cfg, parts[0], origin), 3600);
+      if (rest[0] === "manifest.json") return json(await manifest(cfg, cfgSeg, origin), 3600);
 
       const [resource, type, id, extraSeg] = rest;
       const strip = (s) => decodeURIComponent((s || "").replace(/\.json$/, ""));
@@ -736,7 +756,7 @@ export default {
       if (type !== "tv" && type !== "series") return json({ metas: [], streams: [] }, 3600);
       if (resource === "catalog") return json(await catalog(cfg, strip(id), parseExtra(strip(extraSeg))), 300);
       if (resource === "meta") return json(await meta(cfg, strip(id)), 600);
-      if (resource === "stream") return json(await stream(cfg, strip(id), parts[0], origin), 600);
+      if (resource === "stream") return json(await stream(cfg, strip(id), cfgSeg, origin), 600);
       return json({ error: "not found" }, 60);
     } catch (e) {
       return json({ error: String(e && e.message || e) }, 10);
